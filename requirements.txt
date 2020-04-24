@@ -5,6 +5,7 @@ matplotlib
 numpy
 pandas
 pre-commit
+pytest
 scikit-learn
 seaborn
 tensorflow
