@@ -1,0 +1,12 @@
+ipdb
+joblib
+jupyter
+matplotlib
+numpy
+pandas
+pre-commit
+scikit-learn
+seaborn
+tensorflow
+tensorflow_hub
+tqdm
