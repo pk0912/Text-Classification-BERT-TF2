@@ -107,22 +107,32 @@ def is_special_none_tensor(tensor):
 
 
 # TODO(hongkuny): consider moving custom string-map lookup to keras api.
-def get_activation(identifier):
-    """Maps a identifier to a Python function, e.g., "relu" => `tf.nn.relu`.
-  It checks string first and if it is one of customized activation not in TF,
-  the corresponding activation will be returned. For non-customized activation
-  names and callable identifiers, always fallback to tf.keras.activations.get.
-  Args:
-    identifier: String name of the activation function or callable.
-  Returns:
-    A Python function corresponding to the activation function.
-  """
-    if isinstance(identifier, six.string_types):
-        name_to_fn = {"gelu": gelu, "custom_swish": swish}
-        identifier = str(identifier).lower()
-        if identifier in name_to_fn:
-            return tf.keras.activations.get(name_to_fn[identifier])
-    return tf.keras.activations.get(identifier)
+def get_activation(activation_string):
+    """
+    Maps a string to a Python function, e.g., "relu" => `tf.nn.relu`.
+    :param activation_string: String name of the activation function.
+    :return: A Python function corresponding to the activation function. If
+        `activation_string` is None, empty, or "linear", this will return None.
+        If `activation_string` is not a string, it will return `activation_string`.
+    :raises: ValueError: The `activation_string` does not correspond to a known
+                activation.
+    """
+
+    # We assume that anything that"s not a string is already an activation
+    # function, so we just return it.
+    if not isinstance(activation_string, six.string_types):
+        return activation_string
+
+    if not activation_string:
+        return None
+
+    act = activation_string.lower()
+    if act in ["linear", "relu", "tanh"]:
+        return tf.keras.activations.get(act)
+    elif act == "gelu":
+        return tf.keras.activations.get(gelu)
+    else:
+        raise ValueError("Unsupported activation: %s" % act)
 
 
 def get_shape_list(tensor, expected_rank=None, name=None):

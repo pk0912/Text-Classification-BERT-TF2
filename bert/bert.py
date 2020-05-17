@@ -187,7 +187,8 @@ class BertLayer(tf.keras.layers.Layer):
         # normalize and perform dropout.
         embedding_output = self.embedding_postprocessor(word_embeddings, token_type_ids)
         attention_mask = create_attention_mask_from_input_mask(input_ids, input_mask)
-        prev_output = reshape_to_matrix(embedding_output)
+        # prev_output = reshape_to_matrix(embedding_output)
+        prev_output = embedding_output
         all_layer_outputs = []
         for layer in self.layers:
             layer_input = prev_output
@@ -423,12 +424,14 @@ class TransformerLayer(tf.keras.layers.Layer):
         Defines layers needed for Transformer Architecture
         :param input_shape: Shape of inputs passed to the __call__ method
         """
+
+        # TODO: calculate batch_size, seq_length, input_width here and pass it to the Attention layer
         self.attention_head = AttentionLayer(
             num_attention_heads=self.num_attention_heads,
             size_per_head=self.attention_head_size,
             attention_probs_dropout_prob=self.attention_probs_dropout_prob,
             initializer_range=self.initializer_range,
-            do_return_2d_tensor=self.do_return_2d_tensor,
+            do_return_2d_tensor=True,
             is_training=self.is_training,
         )
         # Run a linear projection of `hidden_size` then add a residual
@@ -444,7 +447,7 @@ class TransformerLayer(tf.keras.layers.Layer):
         # The activation is only applied to the "intermediate" hidden layer.
         self.intermediate_dense = tf.keras.layers.Dense(
             self.intermediate_size,
-            activation=self.intermediate_act_fn,
+            activation=helpers.get_activation(self.intermediate_act_fn),
             kernel_initializer=helpers.create_initializer(self.initializer_range),
         )
         # Down-project back to `hidden_size` then add the residual.
@@ -480,9 +483,10 @@ class TransformerLayer(tf.keras.layers.Layer):
         :return: float Tensor of shape [batch_size, seq_length, hidden_size], the final
             hidden layer of the Transformer.
         """
-        layer_input = inputs[0]
+        input_tensor = inputs[0]
         attention_mask = inputs[1]
         attention_heads = []
+        layer_input = reshape_to_matrix(input_tensor)
         attention_head = self.attention_head(
             from_tensor=layer_input,
             to_tensor=layer_input,
