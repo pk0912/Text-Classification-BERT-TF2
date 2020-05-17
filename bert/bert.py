@@ -151,6 +151,20 @@ class BertLayer(tf.keras.layers.Layer):
             is_training=is_training,
             name="embedding_postprocessor",
         )
+        self.layers = []
+        for i in range(self.config.num_hidden_layers):
+            self.layers.append(
+                TransformerLayer(
+                    hidden_size=self.config.hidden_size,
+                    num_attention_heads=self.config.num_attention_heads,
+                    intermediate_size=self.config.intermediate_size,
+                    intermediate_act_fn=self.config.hidden_act,
+                    hidden_dropout_prob=self.config.hidden_dropout_prob,
+                    attention_probs_dropout_prob=self.config.attention_probs_dropout_prob,
+                    initializer_range=self.config.initializer_range,
+                    is_training=is_training,
+                )
+            )
 
     def call(self, input_ids, input_mask=None, token_type_ids=None):
         """
@@ -173,6 +187,12 @@ class BertLayer(tf.keras.layers.Layer):
         # normalize and perform dropout.
         embedding_output = self.embedding_postprocessor(word_embeddings, token_type_ids)
         attention_mask = create_attention_mask_from_input_mask(input_ids, input_mask)
+        prev_output = reshape_to_matrix(embedding_output)
+        all_layer_outputs = []
+        for layer in self.layers:
+            layer_input = prev_output
+            prev_output = layer(layer_input, attention_mask)
+            all_layer_outputs.append(prev_output)
         return embedding_output, attention_mask
 
     def get_config(self):
@@ -331,6 +351,21 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
     return mask
 
 
+def reshape_to_matrix(input_tensor):
+    """Reshapes a >= rank 2 tensor to a rank 2 tensor (i.e., a matrix)."""
+    ndims = input_tensor.shape.ndims
+    if ndims < 2:
+        raise ValueError(
+            "Input tensor must have at least rank 2. Shape = %s" % (input_tensor.shape)
+        )
+    if ndims == 2:
+        return input_tensor
+
+    width = input_tensor.shape[-1]
+    output_tensor = tf.reshape(input_tensor, [-1, width])
+    return output_tensor
+
+
 class TransformerLayer(tf.keras.layers.Layer):
     """
     Multi-headed, multi-layer Transformer from "Attention is All You Need".
@@ -344,15 +379,13 @@ class TransformerLayer(tf.keras.layers.Layer):
     def __init__(
         self,
         hidden_size=768,
-        num_hidden_layers=12,
         num_attention_heads=12,
         intermediate_size=3072,
         intermediate_act_fn="gelu",
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
         initializer_range=0.02,
-        do_return_all_layers=False,
-        **kwargs
+        is_training=True,
     ):
         """
         Constructor for Transformer Layer
@@ -365,27 +398,65 @@ class TransformerLayer(tf.keras.layers.Layer):
         :param hidden_dropout_prob: float. Dropout probability for the hidden layers.
         :param attention_probs_dropout_prob: float. Dropout probability of the attention probabilities.
         :param initializer_range: float. Range of the initializer (stddev of truncated normal).
-        :param do_return_all_layers: Whether to also return all layers or just the final layer.
         """
         super(TransformerLayer, self).__init__()
         self.hidden_size = hidden_size
-        self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.intermediate_size = intermediate_size
         self.intermediate_act_fn = intermediate_act_fn
         self.hidden_dropout_prob = hidden_dropout_prob
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
         self.initializer_range = initializer_range
-        self.do_return_all_layers = do_return_all_layers
-        self.all_layers = []
+        self.is_training = is_training
+        self.attention_head_size = int(self.hidden_size / self.num_attention_heads)
+        self.attention_head = None
+        self.attention_dense = None
+        self.attention_dropout = None
+        self.attention_norm = None
+        self.intermediate_dense = None
+        self.output_dense = None
+        self.output_dropout = None
+        self.output_norm = None
 
     def build(self, input_shape):
         """
         Defines layers needed for Transformer Architecture
         :param input_shape: Shape of inputs passed to the __call__ method
         """
-        for i in range(self.num_hidden_layers):
-            pass
+        self.attention_head = AttentionLayer(
+            num_attention_heads=self.num_attention_heads,
+            size_per_head=self.attention_head_size,
+            attention_probs_dropout_prob=self.attention_probs_dropout_prob,
+            initializer_range=self.initializer_range,
+            do_return_2d_tensor=self.do_return_2d_tensor,
+            is_training=self.is_training,
+        )
+        # Run a linear projection of `hidden_size` then add a residual
+        # with `layer_input`.
+        self.attention_dense = tf.keras.layers.Dense(
+            self.hidden_size,
+            kernel_initializer=helpers.create_initializer(self.initializer_range),
+        )
+        self.attention_dropout = tf.keras.layers.Dropout(rate=self.hidden_dropout_prob)
+        self.attention_norm = tf.keras.layers.LayerNormalization(
+            axis=-1, epsilon=1e-3, name="attention_layer_norm"
+        )
+        # The activation is only applied to the "intermediate" hidden layer.
+        self.intermediate_dense = tf.keras.layers.Dense(
+            self.intermediate_size,
+            activation=self.intermediate_act_fn,
+            kernel_initializer=helpers.create_initializer(self.initializer_range),
+        )
+        # Down-project back to `hidden_size` then add the residual.
+        self.output_dense = tf.keras.layers.Dense(
+            self.hidden_size,
+            kernel_initializer=helpers.create_initializer(self.initializer_range),
+        )
+        self.output_dropout = tf.keras.layers.Dropout(rate=self.hidden_dropout_prob)
+        self.output_norm = tf.keras.layers.LayerNormalization(
+            axis=-1, epsilon=1e-3, name="output_layer_norm"
+        )
+        super(TransformerLayer, self).build(input_shape)
 
     def __call__(self, input_tensor, attention_mask=None, **kwargs):
         """
@@ -409,5 +480,111 @@ class TransformerLayer(tf.keras.layers.Layer):
         :return: float Tensor of shape [batch_size, seq_length, hidden_size], the final
             hidden layer of the Transformer.
         """
-        input_tensor = inputs[0]
+        layer_input = inputs[0]
         attention_mask = inputs[1]
+        attention_heads = []
+        attention_head = self.attention_head(
+            from_tensor=layer_input,
+            to_tensor=layer_input,
+            attention_mask=attention_mask,
+        )
+        attention_heads.append(attention_head)
+        if len(attention_heads) == 1:
+            attention_output = attention_heads[0]
+        else:
+            # In the case where we have other sequences, we just concatenate
+            # them to the self-attention head before the projection.
+            attention_output = tf.concat(attention_heads, axis=-1)
+        attention_output = self.attention_dense(attention_output)
+        attention_output = self.attention_dropout(
+            attention_output, training=self.is_training
+        )
+        attention_output = self.attention_norm(attention_output + layer_input)
+        intermediate_output = self.intermediate_dense(attention_output)
+        layer_output = self.output_dense(intermediate_output)
+        layer_output = self.output_dropout(layer_output, training=self.is_training)
+        layer_output = self.output_norm(layer_output + attention_output)
+        return layer_output
+
+
+class AttentionLayer(tf.keras.layers.Layer):
+    """
+    Performs multi-headed attention from `from_tensor` to `to_tensor`.
+    This is an implementation of multi-headed attention based on "Attention
+    is all you Need". If `from_tensor` and `to_tensor` are the same, then
+    this is self-attention. Each timestep in `from_tensor` attends to the
+    corresponding sequence in `to_tensor`, and returns a fixed-with vector.
+    This function first projects `from_tensor` into a "query" tensor and
+    `to_tensor` into "key" and "value" tensors. These are (effectively) a list
+    of tensors of length `num_attention_heads`, where each tensor is of shape
+    [batch_size, seq_length, size_per_head].
+    Then, the query and key tensors are dot-producted and scaled. These are
+    softmaxed to obtain attention probabilities. The value tensors are then
+    interpolated by these probabilities, then concatenated back to a single
+    tensor and returned.
+    In practice, the multi-headed attention are done with transposes and
+    reshapes rather than actual separate tensors.
+    """
+
+    def __init__(
+        self,
+        num_attention_heads=12,
+        size_per_head=64,
+        attention_probs_dropout_prob=0.1,
+        initializer_range=0.02,
+        do_return_2d_tensor=False,
+        is_training=True,
+    ):
+        """
+        Constructor for Attention Layer
+        :param num_attention_heads: int. Number of attention heads.
+        :param size_per_head: int. Size of each attention head.
+        :param attention_probs_dropout_prob: (optional) float. Dropout probability of the
+            attention probabilities.
+        :param initializer_range: float. Range of the weight initializer.
+        :param do_return_2d_tensor: bool. If True, the output will be of shape [batch_size
+            * from_seq_length, num_attention_heads * size_per_head]. If False, the
+            output will be of shape [batch_size, from_seq_length, num_attention_heads
+            * size_per_head].
+        """
+        super(AttentionLayer, self).__init__()
+        self.num_attention_heads = num_attention_heads
+        self.size_per_head = size_per_head
+        self.attention_probs_dropout_prob = attention_probs_dropout_prob
+        self.initializer_range = initializer_range
+        self.do_return_2d_tensor = do_return_2d_tensor
+        self.is_training = is_training
+        self.attention_probs_dropout = tf.keras.layers.Dropout(
+            rate=self.attention_probs_dropout_prob
+        )
+
+    def __call__(self, from_tensor, to_tensor, attention_mask=None, **kwargs):
+        """
+        __call__ method for AttentionLayer
+        :param from_tensor: float Tensor of shape [batch_size, from_seq_length,
+            from_width].
+        :param to_tensor: float Tensor of shape [batch_size, to_seq_length, to_width].
+        :param attention_mask: (optional) int32 Tensor of shape [batch_size,
+            from_seq_length, to_seq_length]. The values should be 1 or 0. The
+            attention scores will effectively be set to -infinity for any positions in
+            the mask that are 0, and will be unchanged for positions that are 1.
+        :param kwargs: keyword arguments.
+        :return: float Tensor of shape [batch_size, from_seq_length,
+            num_attention_heads * size_per_head]. (If `do_return_2d_tensor` is
+            true, this will be of shape [batch_size * from_seq_length,
+            num_attention_heads * size_per_head]).
+        """
+        inputs = [from_tensor, to_tensor, attention_mask]
+        return super(AttentionLayer, self).__call__(inputs, **kwargs)
+
+    def call(self, inputs, **kwargs):
+        """
+        call method for AttentionLayer
+        :param inputs: contains from_tensor, to_tensor and attention_mask
+        :param kwargs: keyword arguments.
+        :return: float Tensor of shape [batch_size, from_seq_length,
+            num_attention_heads * size_per_head]. (If `do_return_2d_tensor` is
+            true, this will be of shape [batch_size * from_seq_length,
+            num_attention_heads * size_per_head]).
+        """
+        return []
