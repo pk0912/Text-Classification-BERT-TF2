@@ -14,13 +14,9 @@
 # limitations under the License.
 """The main BERT model and related functions."""
 
-
-import collections
 import copy
 import json
 import math
-import re
-import numpy as np
 import six
 import tensorflow as tf
 from . import helpers
@@ -151,20 +147,27 @@ class BertLayer(tf.keras.layers.Layer):
             is_training=is_training,
             name="embedding_postprocessor",
         )
-        self.layers = []
-        for i in range(self.config.num_hidden_layers):
-            self.layers.append(
-                TransformerLayer(
-                    hidden_size=self.config.hidden_size,
-                    num_attention_heads=self.config.num_attention_heads,
-                    intermediate_size=self.config.intermediate_size,
-                    intermediate_act_fn=self.config.hidden_act,
-                    hidden_dropout_prob=self.config.hidden_dropout_prob,
-                    attention_probs_dropout_prob=self.config.attention_probs_dropout_prob,
-                    initializer_range=self.config.initializer_range,
-                    is_training=is_training,
-                )
-            )
+        self.encoder = Transformer(
+            hidden_size=self.config.hidden_size,
+            num_hidden_layers=self.config.num_hidden_layers,
+            num_attention_heads=self.config.num_attention_heads,
+            intermediate_size=self.config.intermediate_size,
+            intermediate_act_fn=self.config.hidden_act,
+            hidden_dropout_prob=self.config.hidden_dropout_prob,
+            attention_probs_dropout_prob=self.config.attention_probs_dropout_prob,
+            initializer_range=self.config.initializer_range,
+            is_training=is_training,
+            do_return_all_layers=True,
+            name="encoder",
+        )
+        self.pooler = tf.keras.layers.Dense(
+            self.config.hidden_size,
+            activation=helpers.get_activation("tanh"),
+            kernel_initializer=helpers.create_initializer(
+                self.config.initializer_range
+            ),
+            name="pooler",
+        )
 
     def call(self, input_ids, input_mask=None, token_type_ids=None):
         """
@@ -187,14 +190,11 @@ class BertLayer(tf.keras.layers.Layer):
         # normalize and perform dropout.
         embedding_output = self.embedding_postprocessor(word_embeddings, token_type_ids)
         attention_mask = create_attention_mask_from_input_mask(input_ids, input_mask)
-        # prev_output = reshape_to_matrix(embedding_output)
-        prev_output = embedding_output
-        all_layer_outputs = []
-        for layer in self.layers:
-            layer_input = prev_output
-            prev_output = layer(layer_input, attention_mask)
-            all_layer_outputs.append(prev_output)
-        return embedding_output, attention_mask
+        all_encoder_layers = self.encoder(embedding_output, attention_mask)
+        sequence_output = all_encoder_layers[-1]
+        first_token_tensor = tf.squeeze(sequence_output[:, 0:1, :], axis=1)
+        pooled_output = self.pooler(first_token_tensor)
+        return pooled_output
 
     def get_config(self):
         config = super().get_config().copy()
@@ -214,7 +214,7 @@ class EmbeddingPostProcessor(tf.keras.layers.Layer):
         max_position_embeddings=512,
         dropout_prob=0.1,
         is_training=True,
-        **kwargs
+        **kwargs,
     ):
         """
         Constructor for EmbeddingPostProcessor Layer
@@ -357,7 +357,7 @@ def reshape_to_matrix(input_tensor):
     ndims = input_tensor.shape.ndims
     if ndims < 2:
         raise ValueError(
-            "Input tensor must have at least rank 2. Shape = %s" % (input_tensor.shape)
+            "Input tensor must have at least rank 2. Shape = %s" % input_tensor.shape
         )
     if ndims == 2:
         return input_tensor
@@ -367,16 +367,158 @@ def reshape_to_matrix(input_tensor):
     return output_tensor
 
 
-class TransformerLayer(tf.keras.layers.Layer):
+def reshape_from_matrix(output_tensor, orig_shape_list):
+    """Reshapes a rank 2 tensor back to its original rank >= 2 tensor."""
+    if len(orig_shape_list) == 2:
+        return output_tensor
+
+    output_shape = output_tensor.get_shape()
+
+    orig_dims = orig_shape_list[0:-1]
+    width = output_shape[-1]
+
+    return tf.reshape(output_tensor, orig_dims + [width])
+
+
+def transpose_for_scores(
+    input_tensor, batch_size, num_attention_heads, seq_length, width
+):
+    output_tensor = tf.reshape(
+        input_tensor, [batch_size, seq_length, num_attention_heads, width]
+    )
+
+    output_tensor = tf.transpose(output_tensor, [0, 2, 1, 3])
+    return output_tensor
+
+
+class Transformer(tf.keras.layers.Layer):
     """
-    Multi-headed, multi-layer Transformer from "Attention is All You Need".
-    This is almost an exact implementation of the original Transformer encoder.
-    See the original paper:
-    https://arxiv.org/abs/1706.03762
-    Also see:
-    https://github.com/tensorflow/tensor2tensor/blob/master/tensor2tensor/models/transformer.py
+        Multi-headed, multi-layer Transformer from "Attention is All You Need".
+        This is almost an exact implementation of the original Transformer encoder.
+        See the original paper:
+        https://arxiv.org/abs/1706.03762
+        Also see:
+        https://github.com/tensorflow/tensor2tensor/blob/master/tensor2tensor/models/transformer.py
     """
 
+    def __init__(
+        self,
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        intermediate_size=3072,
+        intermediate_act_fn="gelu",
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        initializer_range=0.02,
+        is_training=True,
+        do_return_all_layers=False,
+        **kwargs,
+    ):
+        """
+        Constructor for Transformer Class
+        :param hidden_size: int. Hidden size of the Transformer.
+        :param num_attention_heads: int. Number of attention heads in the Transformer.
+        :param intermediate_size: int. The size of the "intermediate" (a.k.a., feed forward) layer.
+        :param intermediate_act_fn: function. The non-linear activation function to apply
+            to the output of the intermediate/feed-forward layer.
+        :param hidden_dropout_prob: float. Dropout probability for the hidden layers.
+        :param attention_probs_dropout_prob: float. Dropout probability of the attention probabilities.
+        :param initializer_range: float. Range of the initializer (stddev of truncated normal).
+        :param is_training: If true, dropout will be done, else not.
+        """
+        super(Transformer, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.intermediate_size = intermediate_size
+        self.intermediate_act_fn = intermediate_act_fn
+        self.hidden_dropout_prob = hidden_dropout_prob
+        self.attention_probs_dropout_prob = attention_probs_dropout_prob
+        self.initializer_range = initializer_range
+        self.is_training = is_training
+        self.batch_size = None
+        self.seq_length = None
+        self.input_width = None
+        self.do_return_all_layers = do_return_all_layers
+        self.input_tensor_shape = []
+        self.layers = []
+
+    def build(self, input_shape):
+        """
+        Initializes n transformer layers.
+        :param input_shape: Shape of inputs passed to the __call__ method
+        """
+        self.input_tensor_shape = input_shape[0]
+        self.batch_size = self.input_tensor_shape[0]
+        self.seq_length = self.input_tensor_shape[1]
+        self.input_width = self.input_tensor_shape[2]
+        for i in range(self.num_hidden_layers):
+            self.layers.append(
+                TransformerLayer(
+                    hidden_size=self.hidden_size,
+                    num_attention_heads=self.num_attention_heads,
+                    intermediate_size=self.intermediate_size,
+                    intermediate_act_fn=self.intermediate_act_fn,
+                    hidden_dropout_prob=self.hidden_dropout_prob,
+                    attention_probs_dropout_prob=self.attention_probs_dropout_prob,
+                    initializer_range=self.initializer_range,
+                    is_training=self.is_training,
+                    batch_size=self.batch_size,
+                    seq_length=self.seq_length,
+                    input_width=self.input_width,
+                )
+            )
+        super(Transformer, self).build(input_shape)
+
+    def __call__(self, input_tensor, attention_mask=None, **kwargs):
+        """
+        __call__ method for Transformer class.
+        :param input_tensor: float Tensor of shape [batch_size, seq_length, hidden_size].
+        :param attention_mask: (optional) int32 Tensor of shape [batch_size, seq_length, seq_length],
+            with 1 for positions that can be attended to and 0 in positions that should not be.
+        :param kwargs: keyword arguments
+        :return: float Tensor of shape [batch_size, seq_length, hidden_size], the final
+            hidden layer of the Transformer.
+        """
+        if attention_mask is None:
+            attention_mask = tf.constant([0])
+        return super(Transformer, self).__call__(
+            [input_tensor, attention_mask], **kwargs
+        )
+
+    def call(self, inputs, **kwargs):
+        """
+
+        :param inputs:
+        :param kwargs:
+        :return:
+        """
+        input_tensor = inputs[0]
+        attention_mask = inputs[1]
+        if len(attention_mask.get_shape()) == 1:
+            attention_mask = None
+        prev_output = reshape_to_matrix(input_tensor)
+        all_layer_outputs = []
+        for layer in self.layers:
+            layer_input = prev_output
+            prev_output = layer(layer_input, attention_mask)
+            all_layer_outputs.append(prev_output)
+
+        if self.do_return_all_layers:
+            final_outputs = []
+            for layer_output in all_layer_outputs:
+                final_output = reshape_from_matrix(
+                    layer_output, self.input_tensor_shape
+                )
+                final_outputs.append(final_output)
+            return final_outputs
+        else:
+            final_output = reshape_from_matrix(prev_output, self.input_tensor_shape)
+            return final_output
+
+
+class TransformerLayer(tf.keras.layers.Layer):
     def __init__(
         self,
         hidden_size=768,
@@ -387,11 +529,13 @@ class TransformerLayer(tf.keras.layers.Layer):
         attention_probs_dropout_prob=0.1,
         initializer_range=0.02,
         is_training=True,
+        batch_size=None,
+        seq_length=None,
+        input_width=None,
     ):
         """
         Constructor for Transformer Layer
         :param hidden_size: int. Hidden size of the Transformer.
-        :param num_hidden_layers: int. Number of layers (blocks) in the Transformer.
         :param num_attention_heads: int. Number of attention heads in the Transformer.
         :param intermediate_size: int. The size of the "intermediate" (a.k.a., feed forward) layer.
         :param intermediate_act_fn: function. The non-linear activation function to apply
@@ -399,6 +543,7 @@ class TransformerLayer(tf.keras.layers.Layer):
         :param hidden_dropout_prob: float. Dropout probability for the hidden layers.
         :param attention_probs_dropout_prob: float. Dropout probability of the attention probabilities.
         :param initializer_range: float. Range of the initializer (stddev of truncated normal).
+        :param is_training: If true, dropout will be done, else not.
         """
         super(TransformerLayer, self).__init__()
         self.hidden_size = hidden_size
@@ -409,6 +554,9 @@ class TransformerLayer(tf.keras.layers.Layer):
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
         self.initializer_range = initializer_range
         self.is_training = is_training
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.input_width = input_width
         self.attention_head_size = int(self.hidden_size / self.num_attention_heads)
         self.attention_head = None
         self.attention_dense = None
@@ -424,14 +572,22 @@ class TransformerLayer(tf.keras.layers.Layer):
         Defines layers needed for Transformer Architecture
         :param input_shape: Shape of inputs passed to the __call__ method
         """
-
-        # TODO: calculate batch_size, seq_length, input_width here and pass it to the Attention layer
+        # The Transformer performs sum residuals on all layers so the input needs
+        # to be the same as the hidden size.
+        if self.input_width != self.hidden_size:
+            raise ValueError(
+                "The width of the input tensor (%d) != hidden size (%d)"
+                % (self.input_width, self.hidden_size)
+            )
         self.attention_head = AttentionLayer(
             num_attention_heads=self.num_attention_heads,
             size_per_head=self.attention_head_size,
             attention_probs_dropout_prob=self.attention_probs_dropout_prob,
             initializer_range=self.initializer_range,
             do_return_2d_tensor=True,
+            batch_size=self.batch_size,
+            from_seq_length=self.seq_length,
+            to_seq_length=self.seq_length,
             is_training=self.is_training,
         )
         # Run a linear projection of `hidden_size` then add a residual
@@ -534,9 +690,15 @@ class AttentionLayer(tf.keras.layers.Layer):
         self,
         num_attention_heads=12,
         size_per_head=64,
+        query_act=None,
+        key_act=None,
+        value_act=None,
         attention_probs_dropout_prob=0.1,
         initializer_range=0.02,
         do_return_2d_tensor=False,
+        batch_size=None,
+        from_seq_length=None,
+        to_seq_length=None,
         is_training=True,
     ):
         """
@@ -550,6 +712,13 @@ class AttentionLayer(tf.keras.layers.Layer):
             * from_seq_length, num_attention_heads * size_per_head]. If False, the
             output will be of shape [batch_size, from_seq_length, num_attention_heads
             * size_per_head].
+        :param batch_size: (Optional) int. If the input is 2D, this might be the batch size
+            of the 3D version of the `from_tensor` and `to_tensor`.
+        :param from_seq_length: (Optional) If the input is 2D, this might be the seq length
+            of the 3D version of the `from_tensor`.
+        :param to_seq_length: (Optional) If the input is 2D, this might be the seq length
+            of the 3D version of the `to_tensor`.
+        :param is_training: If true, dropout will be done, else not.
         """
         super(AttentionLayer, self).__init__()
         self.num_attention_heads = num_attention_heads
@@ -558,6 +727,33 @@ class AttentionLayer(tf.keras.layers.Layer):
         self.initializer_range = initializer_range
         self.do_return_2d_tensor = do_return_2d_tensor
         self.is_training = is_training
+        self.batch_size = batch_size
+        self.from_seq_length = from_seq_length
+        self.to_seq_length = to_seq_length
+
+        # `query_layer` = [B*F, N*H]
+        self.query_layer = tf.keras.layers.Dense(
+            self.num_attention_heads * self.size_per_head,
+            activation=query_act,
+            kernel_initializer=helpers.create_initializer(self.initializer_range),
+            name="query",
+        )
+
+        # `key_layer` = [B*T, N*H]
+        self.key_layer = tf.keras.layers.Dense(
+            self.num_attention_heads * self.size_per_head,
+            activation=key_act,
+            kernel_initializer=helpers.create_initializer(self.initializer_range),
+            name="key",
+        )
+
+        # `value_layer` = [B*T, N*H]
+        self.value_layer = tf.keras.layers.Dense(
+            self.num_attention_heads * self.size_per_head,
+            activation=value_act,
+            kernel_initializer=helpers.create_initializer(self.initializer_range),
+            name="value",
+        )
         self.attention_probs_dropout = tf.keras.layers.Dropout(
             rate=self.attention_probs_dropout_prob
         )
@@ -591,4 +787,135 @@ class AttentionLayer(tf.keras.layers.Layer):
             true, this will be of shape [batch_size * from_seq_length,
             num_attention_heads * size_per_head]).
         """
-        return []
+        from_tensor = inputs[0]
+        to_tensor = inputs[1]
+        attention_mask = inputs[2]
+
+        from_shape = from_tensor.get_shape()
+        to_shape = to_tensor.get_shape()
+
+        if len(from_shape) != len(to_shape):
+            raise ValueError(
+                "The rank of `from_tensor` must match the rank of `to_tensor`."
+            )
+
+        if len(from_shape) == 3:
+            self.batch_size = from_shape[0]
+            self.from_seq_length = from_shape[1]
+            self.to_seq_length = to_shape[1]
+        elif len(from_shape) == 2:
+            if (
+                self.batch_size is None
+                or self.from_seq_length is None
+                or self.to_seq_length is None
+            ):
+                raise ValueError(
+                    "When passing in rank 2 tensors to attention_layer, the values "
+                    "for `batch_size`, `from_seq_length`, and `to_seq_length` "
+                    "must all be specified."
+                )
+
+        # Scalar dimensions referenced here:
+        #   B = batch size (number of sequences)
+        #   F = `from_tensor` sequence length
+        #   T = `to_tensor` sequence length
+        #   N = `num_attention_heads`
+        #   H = `size_per_head`
+
+        from_tensor_2d = reshape_to_matrix(from_tensor)
+        to_tensor_2d = reshape_to_matrix(to_tensor)
+
+        query_layer = self.query_layer(from_tensor_2d)
+        key_layer = self.key_layer(to_tensor_2d)
+        value_layer = self.value_layer(to_tensor_2d)
+
+        # `query_layer` = [B, N, F, H]
+        query_layer = transpose_for_scores(
+            query_layer,
+            self.batch_size,
+            self.num_attention_heads,
+            self.from_seq_length,
+            self.size_per_head,
+        )
+
+        # `key_layer` = [B, N, T, H]
+        key_layer = transpose_for_scores(
+            key_layer,
+            self.batch_size,
+            self.num_attention_heads,
+            self.to_seq_length,
+            self.size_per_head,
+        )
+
+        # Take the dot product between "query" and "key" to get the raw
+        # attention scores.
+        # `attention_scores` = [B, N, F, T]
+        attention_scores = tf.matmul(query_layer, key_layer, transpose_b=True)
+        attention_scores = tf.multiply(
+            attention_scores, 1.0 / math.sqrt(float(self.size_per_head))
+        )
+
+        if attention_mask is not None:
+            # `attention_mask` = [B, 1, F, T]
+            attention_mask = tf.expand_dims(attention_mask, axis=[1])
+
+            # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
+            # masked positions, this operation will create a tensor which is 0.0 for
+            # positions we want to attend and -10000.0 for masked positions.
+            adder = (1.0 - tf.cast(attention_mask, tf.float32)) * -10000.0
+
+            # Since we are adding it to the raw scores before the softmax, this is
+            # effectively the same as removing these entirely.
+            attention_scores += adder
+
+            # Normalize the attention scores to probabilities.
+            # `attention_probs` = [B, N, F, T]
+        attention_probs = tf.nn.softmax(attention_scores)
+
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        attention_probs = self.attention_probs_dropout(
+            attention_probs, training=self.is_training
+        )
+
+        # `value_layer` = [B, T, N, H]
+        value_layer = tf.reshape(
+            value_layer,
+            [
+                self.batch_size,
+                self.to_seq_length,
+                self.num_attention_heads,
+                self.size_per_head,
+            ],
+        )
+
+        # `value_layer` = [B, N, T, H]
+        value_layer = tf.transpose(value_layer, [0, 2, 1, 3])
+
+        # `context_layer` = [B, N, F, H]
+        context_layer = tf.matmul(attention_probs, value_layer)
+
+        # `context_layer` = [B, F, N, H]
+        context_layer = tf.transpose(context_layer, [0, 2, 1, 3])
+
+        if self.do_return_2d_tensor:
+            # `context_layer` = [B*F, N*H]
+            context_layer = tf.reshape(
+                context_layer,
+                [
+                    self.batch_size * self.from_seq_length,
+                    self.num_attention_heads * self.size_per_head,
+                ],
+            )
+        else:
+            # `context_layer` = [B, F, N*H]
+            context_layer = tf.reshape(
+                context_layer,
+                [
+                    self.batch_size,
+                    self.from_seq_length,
+                    self.num_attention_heads * self.size_per_head,
+                ],
+            )
+
+        return context_layer
