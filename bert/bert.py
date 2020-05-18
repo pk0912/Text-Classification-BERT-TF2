@@ -211,7 +211,6 @@ class BertLayer(tf.keras.layers.Layer):
             token_type_ids = None
         input_shape = helpers.get_shape_list(input_ids, expected_rank=2)
         batch_size = input_shape[0]
-        print(batch_size)
         seq_length = input_shape[1]
         if input_mask is None:
             input_mask = tf.ones(shape=[batch_size, seq_length], dtype=tf.int32)
@@ -223,7 +222,7 @@ class BertLayer(tf.keras.layers.Layer):
         # normalize and perform dropout.
         embedding_output = self.embedding_postprocessor(word_embeddings, token_type_ids)
         attention_mask = create_attention_mask_from_input_mask(input_ids, input_mask)
-        all_encoder_layers = self.encoder(embedding_output, attention_mask)
+        all_encoder_layers = self.encoder(embedding_output, attention_mask, batch_size)
         sequence_output = all_encoder_layers[-1]
         first_token_tensor = tf.squeeze(sequence_output[:, 0:1, :], axis=1)
         pooled_output = self.pooler(first_token_tensor)
@@ -470,7 +469,6 @@ class Transformer(tf.keras.layers.Layer):
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
         self.initializer_range = initializer_range
         self.is_training = is_training
-        self.batch_size = None
         self.seq_length = None
         self.input_width = None
         self.do_return_all_layers = do_return_all_layers
@@ -483,7 +481,6 @@ class Transformer(tf.keras.layers.Layer):
         :param input_shape: Shape of inputs passed to the __call__ method
         """
         self.input_tensor_shape = input_shape[0]
-        self.batch_size = self.input_tensor_shape[0]
         self.seq_length = self.input_tensor_shape[1]
         self.input_width = self.input_tensor_shape[2]
         for i in range(self.num_hidden_layers):
@@ -497,14 +494,13 @@ class Transformer(tf.keras.layers.Layer):
                     attention_probs_dropout_prob=self.attention_probs_dropout_prob,
                     initializer_range=self.initializer_range,
                     is_training=self.is_training,
-                    batch_size=self.batch_size,
                     seq_length=self.seq_length,
                     input_width=self.input_width,
                 )
             )
         super(Transformer, self).build(input_shape)
 
-    def __call__(self, input_tensor, attention_mask=None, **kwargs):
+    def __call__(self, input_tensor, attention_mask=None, batch_size=None, **kwargs):
         """
         __call__ method for Transformer class.
         :param input_tensor: float Tensor of shape [batch_size, seq_length, hidden_size].
@@ -516,8 +512,10 @@ class Transformer(tf.keras.layers.Layer):
         """
         if attention_mask is None:
             attention_mask = tf.constant([0])
+        if batch_size is None:
+            batch_size = tf.constant([0])
         return super(Transformer, self).__call__(
-            [input_tensor, attention_mask], **kwargs
+            [input_tensor, attention_mask, batch_size], **kwargs
         )
 
     def call(self, inputs, **kwargs):
@@ -529,25 +527,30 @@ class Transformer(tf.keras.layers.Layer):
         """
         input_tensor = inputs[0]
         attention_mask = inputs[1]
+        batch_size = inputs[2]
         if len(attention_mask.get_shape()) == 1:
             attention_mask = None
+        if len(batch_size.get_shape()) == 1:
+            batch_size = None
         prev_output = reshape_to_matrix(input_tensor)
         all_layer_outputs = []
         for layer in self.layers:
             layer_input = prev_output
-            prev_output = layer(layer_input, attention_mask)
+            prev_output = layer(layer_input, attention_mask, batch_size)
             all_layer_outputs.append(prev_output)
 
         if self.do_return_all_layers:
             final_outputs = []
             for layer_output in all_layer_outputs:
                 final_output = reshape_from_matrix(
-                    layer_output, self.input_tensor_shape
+                    layer_output, [batch_size, self.seq_length, self.input_width]
                 )
                 final_outputs.append(final_output)
             return final_outputs
         else:
-            final_output = reshape_from_matrix(prev_output, self.input_tensor_shape)
+            final_output = reshape_from_matrix(
+                prev_output, [batch_size, self.seq_length, self.input_width]
+            )
             return final_output
 
 
@@ -562,7 +565,6 @@ class TransformerLayer(tf.keras.layers.Layer):
         attention_probs_dropout_prob=0.1,
         initializer_range=0.02,
         is_training=True,
-        batch_size=None,
         seq_length=None,
         input_width=None,
     ):
@@ -587,7 +589,6 @@ class TransformerLayer(tf.keras.layers.Layer):
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
         self.initializer_range = initializer_range
         self.is_training = is_training
-        self.batch_size = batch_size
         self.seq_length = seq_length
         self.input_width = input_width
         self.attention_head_size = int(self.hidden_size / self.num_attention_heads)
@@ -618,7 +619,6 @@ class TransformerLayer(tf.keras.layers.Layer):
             attention_probs_dropout_prob=self.attention_probs_dropout_prob,
             initializer_range=self.initializer_range,
             do_return_2d_tensor=True,
-            batch_size=self.batch_size,
             from_seq_length=self.seq_length,
             to_seq_length=self.seq_length,
             is_training=self.is_training,
@@ -650,7 +650,7 @@ class TransformerLayer(tf.keras.layers.Layer):
         )
         super(TransformerLayer, self).build(input_shape)
 
-    def __call__(self, input_tensor, attention_mask=None, **kwargs):
+    def __call__(self, input_tensor, attention_mask=None, batch_size=None, **kwargs):
         """
         __call__ method for TransformerLayer
         :param input_tensor: float Tensor of shape [batch_size, seq_length, hidden_size].
@@ -661,7 +661,7 @@ class TransformerLayer(tf.keras.layers.Layer):
             hidden layer of the Transformer.
         """
         return super(TransformerLayer, self).__call__(
-            [input_tensor, attention_mask], **kwargs
+            [input_tensor, attention_mask, batch_size], **kwargs
         )
 
     def call(self, inputs, **kwargs):
@@ -674,12 +674,14 @@ class TransformerLayer(tf.keras.layers.Layer):
         """
         input_tensor = inputs[0]
         attention_mask = inputs[1]
+        batch_size = inputs[2]
         attention_heads = []
         layer_input = reshape_to_matrix(input_tensor)
         attention_head = self.attention_head(
             from_tensor=layer_input,
             to_tensor=layer_input,
             attention_mask=attention_mask,
+            batch_size=batch_size,
         )
         attention_heads.append(attention_head)
         if len(attention_heads) == 1:
@@ -729,7 +731,6 @@ class AttentionLayer(tf.keras.layers.Layer):
         attention_probs_dropout_prob=0.1,
         initializer_range=0.02,
         do_return_2d_tensor=False,
-        batch_size=None,
         from_seq_length=None,
         to_seq_length=None,
         is_training=True,
@@ -760,9 +761,9 @@ class AttentionLayer(tf.keras.layers.Layer):
         self.initializer_range = initializer_range
         self.do_return_2d_tensor = do_return_2d_tensor
         self.is_training = is_training
-        self.batch_size = batch_size
         self.from_seq_length = from_seq_length
         self.to_seq_length = to_seq_length
+        self.batch_size = None
 
         # `query_layer` = [B*F, N*H]
         self.query_layer = tf.keras.layers.Dense(
@@ -791,7 +792,9 @@ class AttentionLayer(tf.keras.layers.Layer):
             rate=self.attention_probs_dropout_prob
         )
 
-    def __call__(self, from_tensor, to_tensor, attention_mask=None, **kwargs):
+    def __call__(
+        self, from_tensor, to_tensor, attention_mask=None, batch_size=None, **kwargs
+    ):
         """
         __call__ method for AttentionLayer
         :param from_tensor: float Tensor of shape [batch_size, from_seq_length,
@@ -807,7 +810,7 @@ class AttentionLayer(tf.keras.layers.Layer):
             true, this will be of shape [batch_size * from_seq_length,
             num_attention_heads * size_per_head]).
         """
-        inputs = [from_tensor, to_tensor, attention_mask]
+        inputs = [from_tensor, to_tensor, attention_mask, batch_size]
         return super(AttentionLayer, self).__call__(inputs, **kwargs)
 
     def call(self, inputs, **kwargs):
@@ -823,6 +826,7 @@ class AttentionLayer(tf.keras.layers.Layer):
         from_tensor = inputs[0]
         to_tensor = inputs[1]
         attention_mask = inputs[2]
+        self.batch_size = inputs[3]
 
         from_shape = helpers.get_shape_list(from_tensor, expected_rank=[2, 3])
         to_shape = helpers.get_shape_list(to_tensor, expected_rank=[2, 3])
