@@ -129,6 +129,17 @@ class BertLayer(tf.keras.layers.Layer):
         if not is_training:
             self.config.hidden_dropout_prob = 0.0
             self.config.attention_probs_dropout_prob = 0.0
+        self.is_training = is_training
+        self.embedding_lookup = None
+        self.embedding_postprocessor = None
+        self.encoder = None
+        self.pooler = None
+
+    def build(self, input_shape):
+        """
+        Defines layers needed for Bert Architecture
+        :param input_shape: Shape of inputs passed to the __call__ method
+        """
         self.embedding_lookup = tf.keras.layers.Embedding(
             self.config.vocab_size,
             self.config.hidden_size,
@@ -144,7 +155,7 @@ class BertLayer(tf.keras.layers.Layer):
             initializer_range=self.config.initializer_range,
             max_position_embeddings=self.config.max_position_embeddings,
             dropout_prob=self.config.hidden_dropout_prob,
-            is_training=is_training,
+            is_training=self.is_training,
             name="embedding_postprocessor",
         )
         self.encoder = Transformer(
@@ -156,7 +167,7 @@ class BertLayer(tf.keras.layers.Layer):
             hidden_dropout_prob=self.config.hidden_dropout_prob,
             attention_probs_dropout_prob=self.config.attention_probs_dropout_prob,
             initializer_range=self.config.initializer_range,
-            is_training=is_training,
+            is_training=self.is_training,
             do_return_all_layers=True,
             name="encoder",
         )
@@ -169,16 +180,38 @@ class BertLayer(tf.keras.layers.Layer):
             name="pooler",
         )
 
-    def call(self, input_ids, input_mask=None, token_type_ids=None):
+    def __call__(self, input_ids, input_mask=None, token_type_ids=None, **kwargs):
         """
-        Call method for bert layer
-        :param input_ids:
-        :param input_mask:
-        :param token_type_ids:
+        __call__ method for BertLayer
+        :param input_ids: int32 Tensor of shape [batch_size, seq_length].
+        :param input_mask: (optional) int32 Tensor of shape [batch_size, seq_length].
+        :param token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
+        :param kwargs: keyword arguments.
         :return: Output tensor of the pooler layer of shape ([batch_size, hidden_size])
         """
-        input_shape = input_ids.get_shape()
+        if input_mask is None:
+            input_mask = tf.constant([0])
+        if token_type_ids is None:
+            token_type_ids = tf.constant([0])
+        inputs = [input_ids, input_mask, token_type_ids]
+        return super(BertLayer, self).__call__(inputs, **kwargs)
+
+    def call(self, inputs, **kwargs):
+        """
+        Call method for bert layer
+        :param inputs: contains input_ids, input_mask, token_type_ids
+        :return: Output tensor of the pooler layer of shape ([batch_size, hidden_size])
+        """
+        input_ids = inputs[0]
+        input_mask = inputs[1]
+        token_type_ids = inputs[2]
+        if len(input_mask.get_shape()) == 1:
+            input_mask = None
+        if len(token_type_ids.get_shape()) == 1:
+            token_type_ids = None
+        input_shape = helpers.get_shape_list(input_ids, expected_rank=2)
         batch_size = input_shape[0]
+        print(batch_size)
         seq_length = input_shape[1]
         if input_mask is None:
             input_mask = tf.ones(shape=[batch_size, seq_length], dtype=tf.int32)
@@ -292,7 +325,7 @@ class EmbeddingPostProcessor(tf.keras.layers.Layer):
         :return: float tensor with same shape as `input_tensor`.
         """
         input_tensor, token_type_ids = inputs
-        input_shape = input_tensor.get_shape()
+        input_shape = helpers.get_shape_list(input_tensor, expected_rank=3)
         batch_size = input_shape[0]
         seq_length = input_shape[1]
         width = input_shape[2]
@@ -330,11 +363,11 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
     Returns:
     float Tensor of shape [batch_size, from_seq_length, to_seq_length].
     """
-    from_shape = from_tensor.get_shape()
+    from_shape = helpers.get_shape_list(from_tensor, expected_rank=[2, 3])
     batch_size = from_shape[0]
     from_seq_length = from_shape[1]
 
-    to_shape = to_mask.get_shape()
+    to_shape = helpers.get_shape_list(to_mask, expected_rank=2)
     to_seq_length = to_shape[1]
 
     to_mask = tf.cast(tf.reshape(to_mask, [batch_size, 1, to_seq_length]), tf.float32)
@@ -372,7 +405,7 @@ def reshape_from_matrix(output_tensor, orig_shape_list):
     if len(orig_shape_list) == 2:
         return output_tensor
 
-    output_shape = output_tensor.get_shape()
+    output_shape = helpers.get_shape_list(output_tensor)
 
     orig_dims = orig_shape_list[0:-1]
     width = output_shape[-1]
@@ -791,8 +824,8 @@ class AttentionLayer(tf.keras.layers.Layer):
         to_tensor = inputs[1]
         attention_mask = inputs[2]
 
-        from_shape = from_tensor.get_shape()
-        to_shape = to_tensor.get_shape()
+        from_shape = helpers.get_shape_list(from_tensor, expected_rank=[2, 3])
+        to_shape = helpers.get_shape_list(to_tensor, expected_rank=[2, 3])
 
         if len(from_shape) != len(to_shape):
             raise ValueError(
