@@ -63,7 +63,7 @@ class DataProcessor(object):
         raise NotImplementedError()
 
     @classmethod
-    def _read_csv(cls, input_file, delimiter=",", header=True, quotechar=None):
+    def _read_csv(cls, input_file, delimiter=",", header=True, quotechar='"'):
         """Reads a tab separated value file."""
         with tf.io.gfile.GFile(input_file, "r") as f:
             reader = csv.reader(f, delimiter=delimiter, quotechar=quotechar)
@@ -96,7 +96,7 @@ class TextDataProcessor(DataProcessor):
         examples = []
         for line in lines:
             examples.append(
-                InputExample(guid=None, text_a=line[1], text_b=None, label=line[0])
+                InputExample(guid=None, text_a=line[0], text_b=None, label=line[1])
             )
         return examples
 
@@ -116,8 +116,11 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         tokens.append("[CLS]")
         segment_ids.append(0)
         for token in tokens_a:
-            tokens.append(token)
-            segment_ids.append(0)
+            if len(tokens) < max_seq_length - 1:
+                tokens.append(token)
+                segment_ids.append(0)
+            else:
+                break
         tokens.append("[SEP]")
         segment_ids.append(0)
         input_ids = tokenizer.convert_tokens_to_ids(tokens)
